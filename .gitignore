@@ -1,0 +1,28 @@
+# =========================
+# Ignorar archivos de Python
+# =========================
+# Archivos compilados
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Entornos virtuales
+venv/
+env/
+.env
+
+# =========================
+# Ignorar archivos de Arduino
+# =========================
+# Archivos generados por el compilador
+build/
+*.hex
+*.elf
+*.bin
+*.eep
+*.o
+*.a
+
+# Archivos temporales de IDE y SO
+.DS_Store
+Thumbs.db
