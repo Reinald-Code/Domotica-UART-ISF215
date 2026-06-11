@@ -1,0 +1,223 @@
+
+#include <Servo.h>
+
+// --- CONFIGURACIÓN DE HARDWARE (PINS) ---
+const uint8_t PIN_TRIG = 11;
+const uint8_t PIN_ECHO = 10;
+const uint8_t PIN_BUZZER = 9;
+const uint8_t PIN_LED_ALERTA = 8;
+const uint8_t PIN_LED_OK = 7;
+const uint8_t PIN_SERVO_PUERTA = 5;
+const uint8_t PIN_SERVO_VENTANA = 6;
+
+// --- CONSTANTES DEL SISTEMA ---
+const uint32_t SERIAL_BAUD = 9600;
+const uint32_t TIMEOUT_UART_MS = 50;
+const uint32_t REFRESH_SENSOR_MS = 250;
+const uint8_t DISTANCIA_UMBRAL_CM = 20;
+
+// --- DEFINICIÓN DE PROTOCOLO UART ---
+const uint8_t SOF_BYTE = 0xAA;
+
+enum MensajeID : uint8_t {
+  MSG_ALERTA_INTRUSO = 0x01,
+  MSG_ABRIR_PUERTA   = 0x02,
+  MSG_CERRAR_PUERTA  = 0x03,
+  MSG_ABRIR_VENTANA  = 0x04,
+  MSG_CERRAR_VENTANA = 0x05,
+  MSG_ESTADO         = 0x06,
+  MSG_ACK            = 0x07,
+  MSG_ERROR          = 0x08
+};
+
+enum ErrorCodigo : uint8_t {
+  ERR_CHECKSUM = 0xE1,
+  ERR_TIMEOUT  = 0xE2
+};
+
+// --- INSTANCIAS DE ACTUADORES ---
+Servo servoPuerta;
+Servo servoVentana;
+
+// --- VARIABLES DE ESTADO Y MÁQUINA DE ESTADOS UART ---
+enum RX_Estado { WAIT_SOF, WAIT_ID, WAIT_LEN, WAIT_DATA, WAIT_CHK };
+RX_Estado estadoActualRX = WAIT_SOF;
+
+uint8_t rxId = 0, rxLen = 0, rxChk = 0, rxIndexData = 0;
+uint8_t rxBufferData[64];
+uint32_t tUltimoByteRx = 0;
+
+// Variables de estado físico
+bool puertaAbierta = false;
+bool ventanaAbierta = false;
+bool alarmaActiva = false;
+uint32_t tUltimoPing = 0;
+
+// Variables para métricas de tiempo
+uint32_t tiempoInicioProcesamiento = 0;
+
+void setup() {
+  Serial.begin(SERIAL_BAUD);
+  
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_LED_ALERTA, OUTPUT);
+  pinMode(PIN_LED_OK, OUTPUT);
+  
+  servoPuerta.attach(PIN_SERVO_PUERTA);
+  servoVentana.attach(PIN_SERVO_VENTANA);
+  
+  // Estado inicial seguro (Todo cerrado y seguro)
+  actualizarActuadores();
+  digitalWrite(PIN_LED_OK, HIGH);
+}
+
+void loop() {
+  uint32_t tiempoActual = millis();
+  
+  // Monitoreo del sensor de proximidad (No bloqueante)
+  if (tiempoActual - tUltimoPing >= REFRESH_SENSOR_MS) {
+    tUltimoPing = tiempoActual;
+    verificarSensorProximidad();
+  }
+  
+  // Monitoreo de timeout en la recepción de la trama UART
+  if (estadoActualRX != WAIT_SOF && (tiempoActual - tUltimoByteRx > TIMEOUT_UART_MS)) {
+    enviarError(ERR_TIMEOUT);
+    resetMaquinaEstados();
+  }
+  
+  // Ejecución de patrón de alarma intermitente si está activa
+  if (alarmaActiva) {
+    tone(PIN_BUZZER, 2000, 100);
+    digitalWrite(PIN_LED_ALERTA, (tiempoActual / 100) % 2);
+  } else {
+    noTone(PIN_BUZZER);
+    digitalWrite(PIN_LED_ALERTA, LOW);
+  }
+}
+
+/**
+ * @brief Evento nativo de Arduino que se gatilla al recibir datos por hardware UART.
+ */
+void serialEvent() {
+  while (Serial.available() > 0) {
+    uint8_t byteRecibido = Serial.read();
+    tUltimoByteRx = millis();
+    
+    switch (estadoActualRX) {
+      case WAIT_SOF:
+        if (byteRecibido == SOF_BYTE) {
+          tiempoInicioProcesamiento = micros(); // Iniciar medición de rendimiento
+          estadoActualRX = WAIT_ID;
+        }
+        break;
+        
+      case WAIT_ID:
+        rxId = byteRecibido;
+        estadoActualRX = WAIT_LEN;
+        break;
+        
+      case WAIT_LEN:
+        rxLen = byteRecibido;
+        rxIndexData = 0;
+        if (rxLen == 0) {
+          estadoActualRX = WAIT_CHK;
+        } else {
+          estadoActualRX = WAIT_DATA;
+        }
+        break;
+        
+      case WAIT_DATA:
+        rxBufferData[rxIndexData++] = byteRecibido;
+        if (rxIndexData >= rxLen) {
+          estadoActualRX = WAIT_CHK;
+        }
+        break;
+        
+      case WAIT_CHK:
+        rxChk = byteRecibido;
+        validarYProcesarTrama();
+        break;
+    }
+  }
+}
+
+void validarYProcesarTrama() {
+  // Calcular Checksum XOR
+  uint8_t checksumCalculado = rxId ^ rxLen;
+  for (uint8_t i = 0; i < rxLen; i++) {
+    checksumCalculado ^= rxBufferData[i];
+  }
+  
+  if (checksumCalculado != rxChk) {
+    enviarError(ERR_CHECKSUM);
+    resetMaquinaEstados();
+    return;
+  }
+  
+  // Procesamiento Semántico del Mensaje Valido
+  switch (rxId) {
+    case MSG_ABRIR_PUERTA:
+      puertaAbierta = true;
+      enviarACK(MSG_ABRIR_PUERTA);
+      break;
+    case MSG_CERRAR_PUERTA:
+      puertaAbierta = false;
+      enviarACK(MSG_CERRAR_PUERTA);
+      break;
+    case MSG_ABRIR_VENTANA:
+      ventanaAbierta = true;
+      enviarACK(MSG_ABRIR_VENTANA);
+      break;
+    case MSG_CERRAR_VENTANA:
+      ventanaAbierta = false;
+      enviarACK(MSG_CERRAR_VENTANA);
+      break;
+    case MSG_ESTADO:
+      enviarEstado();
+      break;
+    default:
+      enviarError(0xFF); // Comando Desconocido
+      break;
+  }
+  
+  actualizarActuadores();
+  resetMaquinaEstados();
+}
+
+void verificarSensorProximidad() {
+  // Disparo del pulso ultrasónico limpio
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+  
+  // Medición de eco con un timeout corto para evitar bloqueos prolongados
+  uint32_t duracion = pulseIn(PIN_ECHO, HIGH, 20000); 
+  if(duracion == 0) return; // Lectura fuera de rango o errónea
+  
+  uint8_t distancia = duracion * 0.034 / 2;
+  
+  if (distancia < DISTANCIA_UMBRAL_CM && !alarmaActiva) {
+    alarmaActiva = true;
+    puertaAbierta = false;  // Bloqueo de seguridad automático
+    ventanaAbierta = false;
+    actualizarActuadores();
+    
+    // Notificar inmediatamente al backend Python
+    enviarTrama(MSG_ALERTA_INTRUSO, &distancia, 1);
+  }
+}
+
+void actualizarActuadores() {
+  servoPuerta.write(puertaAbierta ? 90 : 0);
+  servoVentana.write(ventanaAbierta ? 90 : 0);
+  if (!alarmaActiva) {
+    digitalWrite(PIN_LED_OK, HIGH);
+  } else {
+    digitalWrite(PIN_LED_OK, LOW);
+  }
+}
